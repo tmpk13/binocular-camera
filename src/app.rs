@@ -13,6 +13,7 @@ use crate::image::Gray;
 use crate::odometry::Pose;
 use crate::pipeline::{FrameResult, Pipeline, ProcSettings};
 use crate::stereo::PathCount;
+use crate::sysinfo::{Usage, UsageMonitor};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewMode {
@@ -83,6 +84,9 @@ pub struct App {
     map_empty: bool,
     min_confidence: f32,
     pose: Pose,
+    usage: Usage,
+    usage_monitor: UsageMonitor,
+    usage_sampled: std::time::Instant,
     point_size: u32,
     max_depth_m: f32,
     show_frustum: bool,
@@ -136,6 +140,9 @@ impl App {
             map_empty: true,
             min_confidence: 0.85,
             pose: Pose::IDENTITY,
+            usage: Usage::default(),
+            usage_monitor: UsageMonitor::default(),
+            usage_sampled: std::time::Instant::now(),
             point_size: 2,
             max_depth_m: 10.0,
             show_frustum: true,
@@ -413,27 +420,48 @@ impl App {
             });
 
         ui.horizontal(|ui| {
-            if ui.button(if running { "Stop" } else { "Start" }).clicked() {
+            if tip(
+                ui.button(if running { "Stop" } else { "Start" }),
+                "Begin or end streaming from the camera.",
+                "Stopping releases the camera so another program can use it. \
+                 Streaming starts automatically when the app opens, so this is mostly \
+                 for handing the device over or recovering after unplugging it.",
+            )
+            .clicked()
+            {
                 if running {
                     self.stop();
                 } else {
                     self.start(ctx);
                 }
             }
-            if ui.button("Rescan").clicked() {
+            if tip(
+                ui.button("Rescan"),
+                "Look for cameras again.",
+                "Use this after plugging a camera in, or if the one you want is not \
+                 in the list. Devices that report no usable video formats are hidden, \
+                 because a single physical camera often registers several entries and \
+                 only one of them actually carries pictures.",
+            )
+            .clicked()
+            {
                 self.devices = list_capture_devices();
                 self.device_idx = 0;
                 self.refresh_modes();
             }
         });
 
-        if ui
-            .checkbox(&mut self.swap_lr, "Swap left/right halves")
-            .on_hover_text(
-                "Which half of the frame holds the physically-left sensor. \
-                 If the depth map is almost entirely empty, try toggling this.",
-            )
-            .changed()
+        if tip(
+            ui.checkbox(&mut self.swap_lr, "Swap left/right halves"),
+            "Which half of the frame holds the physically-left sensor.",
+            "The camera sends both eyes in one wide picture. If the two halves are \
+             assigned the wrong way round, everything appears to be at a negative \
+             distance, which is impossible, so almost nothing is matched and the \
+             depth view comes out nearly blank rather than looking mirrored. If you \
+             see almost no depth at all, toggle this first - it costs one click to \
+             rule out.",
+        )
+        .changed()
         {
             if let Some(p) = &self.pipeline {
                 p.set_swap_lr(self.swap_lr);
@@ -443,9 +471,14 @@ impl App {
         ui.separator();
         ui.heading("Exposure");
         let mut exp = self.exposure;
-        ui.checkbox(&mut exp.auto, "Auto exposure").on_hover_text(
-            "Both sensors auto-expose independently. Locking exposure keeps a \
-             bright window from clipping one view and steadies the depth map.",
+        tip(
+            ui.checkbox(&mut exp.auto, "Auto exposure"),
+            "Let the sensors choose their own brightness, or lock it.",
+            "The two eyes decide their brightness separately, so a bright window can \
+             leave one view washed out while the other is fine. Nothing can recover \
+             detail from an area that has gone pure white, so on a backlit scene it \
+             is usually better to turn this off and darken the picture until the \
+             bright parts show texture again.",
         );
         let (tr, gr) = self.exposure_limits;
         ui.add_enabled(
@@ -454,7 +487,15 @@ impl App {
                 .text("Exposure")
                 .logarithmic(true),
         );
-        ui.add(egui::Slider::new(&mut exp.gain, gr.min..=gr.max).text("Gain"));
+        tip(
+            ui.add(egui::Slider::new(&mut exp.gain, gr.min..=gr.max).text("Gain")),
+            "Electronic brightening of the sensor signal.",
+            "Gain brightens a dark picture without needing a longer exposure, so it \
+             avoids motion blur. It does this by amplifying whatever the sensor \
+             recorded, including its noise, and speckly pictures are much harder to \
+             match between the two eyes. Prefer more light or a longer exposure \
+             where you can afford it.",
+        );
         if exp != self.exposure {
             // Leaving auto mode: start from wherever it had settled.
             if !exp.auto && self.exposure.auto {
@@ -476,17 +517,47 @@ impl App {
         ui.heading("Matching");
 
         let mut s = self.settings.clone();
-        ui.add(
-            egui::Slider::new(&mut s.downscale, 1..=4)
-                .text("Downscale")
-                .custom_formatter(|v, _| format!("1/{}", v as usize)),
-        )
-        .on_hover_text("Reduces each eye before matching. The main speed control.");
+        tip(
+            ui.add(
+                egui::Slider::new(&mut s.downscale, 1..=4)
+                    .text("Downscale")
+                    .custom_formatter(|v, _| format!("1/{}", v as usize)),
+            ),
+            "Shrink each eye before processing. The main speed control.",
+            "Working on a smaller picture is dramatically faster, because the work \
+             grows roughly with the cube of the size - halving it is about eight \
+             times less work. The cost is that fine detail and thin objects \
+             disappear. This is the first dial to reach for if the view feels \
+             sluggish.",
+        );
 
-        ui.add(egui::Slider::new(&mut s.stereo.max_disparity, 16..=192).text("Disparities"))
-            .on_hover_text("Search width. Raise it to see closer objects, at proportional cost.");
-        ui.add(egui::Slider::new(&mut s.stereo.p1, 1..=64).text("P1 (slope)"));
-        ui.add(egui::Slider::new(&mut s.stereo.p2, 8..=800).text("P2 (jump)"));
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.max_disparity, 16..=192).text("Disparities")),
+            "How far to search for each match. Sets the closest thing that can be seen.",
+            "Depth is worked out from how far something shifts between the left and \
+             right eye. Near things shift a lot, far things barely at all, so this \
+             sets how close an object can be before it shifts further than the \
+             search looks. Raising it lets you see nearer objects and costs \
+             proportionally more time.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.p1, 1..=64).text("P1 (slope)")),
+            "Resistance to small changes in depth between neighbouring pixels.",
+            "Real surfaces are mostly smooth, so neighbouring pixels usually sit at \
+             almost the same distance. This is how strongly that expectation is \
+             enforced for gentle changes, like a floor sloping away. Too low and \
+             flat surfaces come out grainy; too high and gentle slopes flatten into \
+             steps.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.p2, 8..=800).text("P2 (jump)")),
+            "Resistance to abrupt jumps in depth. Must stay above P1.",
+            "The counterpart to P1, for sudden changes rather than gentle ones. Depth \
+             genuinely does jump at the edge of an object, so this must not be so \
+             high that real edges are smoothed away - but raising it does suppress \
+             isolated wrong answers. If the picture looks noisy, raise this before \
+             anything else.",
+        );
 
         egui::ComboBox::from_id_salt("paths")
             .selected_text(s.stereo.paths.label())
@@ -496,27 +567,70 @@ impl App {
                 }
             });
 
-        ui.add(egui::Slider::new(&mut s.stereo.uniqueness, 1.0..=1.5).text("Uniqueness"))
-            .on_hover_text("How much worse the runner-up match must be. Higher rejects more.");
-        ui.add(egui::Slider::new(&mut s.stereo.lr_max_diff, -1..=8).text("L/R tolerance"))
-            .on_hover_text("Max left/right disagreement in pixels. -1 disables the check.");
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.uniqueness, 1.0..=1.5).text("Uniqueness")),
+            "How clearly the best match must beat its nearest rival to be believed.",
+            "Somewhere along a striped or repeating surface there are often several \
+             places that look equally good, and picking between them is a coin flip. \
+             This demands the winner be clearly better than the runner-up before the \
+             answer is trusted. Higher gives fewer but more reliable results.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.lr_max_diff, -1..=8).text("L/R tolerance")),
+            "How far the two eyes may disagree before a match is discarded. -1 disables it.",
+            "The same match is worked out twice, once from each eye's point of view. \
+             If the two answers disagree, something is wrong - usually the point is \
+             visible to one eye but hidden behind an object from the other. This is \
+             the main reason you see empty gaps along the edges of near objects.",
+        );
 
         ui.separator();
         ui.heading("Cleanup");
-        ui.add(egui::Slider::new(&mut s.stereo.min_contrast, 0.0..=20.0).text("Min contrast"))
-            .on_hover_text(
-                "Grey levels of local variation a pixel needs before its match is \
-                 trusted. Raise it to clear speckle from flat or blown-out areas; \
-                 0 disables the gate.",
-            );
-        ui.add(egui::Slider::new(&mut s.stereo.speckle_area, 0..=400).text("Speckle area"));
-        ui.add(egui::Slider::new(&mut s.stereo.speckle_range, 0.5..=8.0).text("Speckle range"));
-        ui.checkbox(&mut s.stereo.median, "3x3 median");
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.min_contrast, 0.0..=20.0).text("Min contrast")),
+            "How much detail an area needs before its depth is trusted. 0 disables it.",
+            "Matching works by finding the same pattern in both eyes. A blank wall or \
+             a blown-out window has no pattern, only sensor noise, and matching noise \
+             produces a confident-looking answer that is pure invention. This \
+             discards those areas so they show as holes instead of fiction. If you \
+             are building a map, turn it down: the map cross-checks frames against \
+             each other and does this job better.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.speckle_area, 0..=400).text("Speckle area")),
+            "Smallest patch kept. Anything smaller is discarded as noise.",
+            "A real surface produces a large connected region at a consistent \
+             distance. A wrong answer usually produces a small island floating on its \
+             own. This removes islands below the given size in pixels, which is what \
+             clears the confetti without touching real objects.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.stereo.speckle_range, 0.5..=8.0).text("Speckle range")),
+            "How similar neighbours must be to count as the same patch.",
+            "Decides where one patch ends and the next begins when scanning for the \
+             small islands above. Loose settings merge an object into the wall behind \
+             it and protect both; tight settings break a single sloped surface into \
+             many pieces and may delete them all.",
+        );
+        tip(
+            ui.checkbox(&mut s.stereo.median, "3x3 median"),
+            "Replace each value with the middle of its neighbours.",
+            "Taking the middle value of a small neighbourhood, rather than the \
+             average, removes single stray pixels while leaving genuine edges sharp - \
+             an average would blur an edge, because a few background values would \
+             drag the result. Cheap, and almost always worth leaving on.",
+        );
 
         ui.separator();
         ui.heading("Alignment");
-        ui.add(egui::Slider::new(&mut s.align.dy, -40..=40).text("Vertical trim"))
-            .on_hover_text("Rows to shift the right view before matching.");
+        tip(
+            ui.add(egui::Slider::new(&mut s.align.dy, -40..=40).text("Vertical trim")),
+            "Shift the right eye up or down to line it up with the left.",
+            "Matching only ever searches sideways, because that is the direction the \
+             two eyes differ. If one eye sits even slightly higher than the other, \
+             the search looks along the wrong row and quietly finds very little. Use \
+             Auto-align to measure it rather than guessing.",
+        );
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(running, egui::Button::new("Auto-align"))
@@ -533,31 +647,57 @@ impl App {
 
         ui.separator();
         ui.heading("Mapping");
-        ui.checkbox(&mut s.mapping, "Track and build map")
-            .on_hover_text(
-                "Estimates camera motion between frames and folds each frame into a \
-             voxel map. Frame-to-frame only, so the trajectory drifts and \
-             revisiting a place will not line up.",
-            );
+        tip(
+            ui.checkbox(&mut s.mapping, "Track and build map"),
+            "Work out how the camera moved, and accumulate frames into one map.",
+            "Each frame only sees what is in front of the camera. To build something \
+             larger, the program has to work out how the camera moved between frames \
+             so it can place each one correctly. Small errors in that estimate add up, \
+             so a long session slowly loses track, and returning to somewhere you \
+             have already been will not line up exactly.",
+        );
         ui.add(
             egui::Slider::new(&mut s.map.voxel_size, 0.005..=0.20)
                 .text("Voxel m")
                 .logarithmic(true),
-        )
-        .on_hover_text("Changing this clears the map; the keys are resolution-dependent.");
-        ui.add(egui::Slider::new(&mut s.map.max_range_m, 0.5..=15.0).text("Map range m"))
-            .on_hover_text("Far points carry the most depth error, so they are worth excluding.");
-        ui.checkbox(&mut s.frame_to_model, "Align to map (frame-to-model)")
-            .on_hover_text(
-                "Register each frame against the map already built instead of \
-                 only against the previous frame. Frame-to-frame error compounds \
-                 every step; the map is an average of many observations, so \
-                 aligning to it corrects error rather than accumulating it.",
-            );
-        ui.checkbox(&mut s.map.carve_free, "Carve free space")
-            .on_hover_text("Let rays that pass through a voxel argue away earlier bad returns.");
-        ui.add(egui::Slider::new(&mut self.min_confidence, -1.0..=3.0).text("Min confidence"))
-            .on_hover_text("Log-odds a voxel needs before it is drawn.");
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut s.map.max_range_m, 0.5..=15.0).text("Map range m")),
+            "Ignore anything further away than this when adding to the map.",
+            "Distance is worked out from a tiny sideways shift between the eyes, and \
+             that shift gets smaller the further away something is. Past a few \
+             metres a barely-measurable difference means a huge change in distance, \
+             so far-away points are mostly guesswork and would pollute the map faster \
+             than they fill it.",
+        );
+        tip(
+            ui.checkbox(&mut s.frame_to_model, "Align to map (frame-to-model)"),
+            "Fit each new frame to the whole map so far, not just to the frame before it.",
+            "Comparing only against the previous frame means every small error is \
+             inherited by the next estimate and never corrected, so the map slowly \
+             bends. The map itself is built from many frames averaged together, so it \
+             is steadier than any single one, and matching against it pulls the \
+             estimate back rather than letting it wander. On plain surfaces this is \
+             often the difference between a map and nothing at all.",
+        );
+        tip(
+            ui.checkbox(&mut s.map.carve_free, "Carve free space"),
+            "Let clear lines of sight erase things previously recorded there.",
+            "If the camera can now see straight through a spot, whatever was recorded \
+             there before must have been wrong. Tracing the empty space between the \
+             camera and each surface lets later frames vote away earlier mistakes, so \
+             the map cleans itself up as you keep looking rather than accumulating \
+             every error forever.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut self.min_confidence, -1.0..=3.0).text("Min confidence")),
+            "How sure the map must be about a spot before drawing it.",
+            "Nothing in the map is recorded as simply present or absent. Each spot \
+             keeps a running score that rises each time something is seen there and \
+             falls when the camera sees through it. This sets how high that score \
+             must be to be shown, so lowering it reveals tentative structure and \
+             raising it shows only what has been confirmed repeatedly.",
+        );
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(running, egui::Button::new("Reset map"))
@@ -602,22 +742,54 @@ impl App {
                         ui.selectable_value(&mut self.cloud_color, c, c.label());
                     }
                 });
-            ui.add(egui::Slider::new(&mut self.point_size, 1..=6).text("Point size"));
-            ui.add(
-                egui::Slider::new(&mut self.max_depth_m, 0.5..=30.0)
-                    .text("Max distance m")
-                    .logarithmic(true),
-            )
-            .on_hover_text(
-                "Discards far points, which are the least reliable and dominate the view.",
+            tip(
+                ui.add(egui::Slider::new(&mut self.point_size, 1..=6).text("Point size")),
+                "How large each dot is drawn.",
+                "Purely cosmetic. Larger dots close the gaps in sparse data and make \
+                 the shape easier to read at a glance, at the cost of hiding fine \
+                 detail. Sparse maps usually read better with this raised a little.",
             );
-            ui.checkbox(&mut self.show_frustum, "Show camera outline");
-            if ui.button("Reset view").clicked() {
+            tip(
+                ui.add(
+                    egui::Slider::new(&mut self.max_depth_m, 0.5..=30.0)
+                        .text("Max distance m")
+                        .logarithmic(true),
+                ),
+                "Hide anything further away than this.",
+                "Distant measurements are the least trustworthy and also take up most \
+                 of the picture, so trimming them usually makes the view clearer \
+                 rather than emptier.",
+            );
+            tip(
+                ui.checkbox(&mut self.show_frustum, "Show camera outline"),
+                "Draw a wireframe marking where the camera is standing.",
+                "Once a 3D view has been turned a little it is genuinely hard to tell \
+                 which way you are now looking. Drawing the camera's own position \
+                 into the scene gives a fixed landmark to orient against, which \
+                 matters more than it sounds after two or three drags.",
+            );
+            if tip(
+                ui.button("Reset view"),
+                "Return the 3D view to the camera's own viewpoint.",
+                "Puts you back where the camera is standing, looking the way it \
+                 looks, so the 3D view lines up with the ordinary picture again. \
+                 Useful when you have rotated far enough to lose your bearings.",
+            )
+            .clicked()
+            {
                 self.orbit_framed = false;
             }
             ui.label("drag rotates, shift+drag pans, scroll zooms");
         }
-        ui.checkbox(&mut self.use_auto_range, "Auto colour range");
+        tip(
+            ui.checkbox(&mut self.use_auto_range, "Auto colour range"),
+            "Fit the colour scale to whatever is currently in view.",
+            "Spreads the full range of colours across the distances actually present, \
+             so a scene spanning only a narrow band still uses every hue instead of \
+             coming out one flat colour. The scale is eased between frames on \
+             purpose: letting it snap around would make a perfectly steady scene \
+             appear to flicker.",
+        );
         if !self.use_auto_range {
             let dmax = self.settings.stereo.max_disparity as f32;
             ui.add(egui::Slider::new(&mut self.range.lo, 0.0..=dmax).text("Range low"));
@@ -627,8 +799,24 @@ impl App {
         ui.separator();
         ui.heading("Geometry");
         ui.label("Nominal values; distances are estimates, not calibrated.");
-        ui.add(egui::Slider::new(&mut self.geometry.baseline_mm, 10.0..=200.0).text("Baseline mm"));
-        ui.add(egui::Slider::new(&mut self.geometry.hfov_deg, 20.0..=140.0).text("H-FOV deg"));
+        tip(
+            ui.add(
+                egui::Slider::new(&mut self.geometry.baseline_mm, 10.0..=200.0).text("Baseline mm"),
+            ),
+            "Distance between the two lenses, in millimetres.",
+            "Measure it off the physical camera. Everything reported in metres is \
+             scaled directly by this number, so if it is 10% out then every distance \
+             and the whole map are 10% out with it. The shape stays right either way; \
+             only the scale depends on this.",
+        );
+        tip(
+            ui.add(egui::Slider::new(&mut self.geometry.hfov_deg, 20.0..=140.0).text("H-FOV deg")),
+            "How wide an angle the camera sees, left edge to right edge.",
+            "Together with the lens spacing this converts a sideways pixel shift into \
+             a real distance. It is a nominal figure typed in by hand, not a measured \
+             one, so treat every distance shown as an estimate. Getting genuinely \
+             accurate numbers needs a proper calibration, which this does not do yet.",
+        );
         if self.settings.geometry != self.geometry {
             // The worker reprojects with its own copy; it must match the UI's.
             self.settings.geometry = self.geometry;
@@ -637,6 +825,44 @@ impl App {
             }
         }
     }
+}
+
+/// Two-stage tooltip: a one-line summary on hover, and a plain-language
+/// explanation once the pointer has rested a while longer.
+///
+/// The second stage *adds to* the first rather than replacing it, so someone who
+/// already knows the term is not made to re-read it to reach the detail, and
+/// someone who does not is not left holding jargon.
+fn tip(resp: egui::Response, short: &str, long: &str) -> egui::Response {
+    /// Extra dwell, in seconds, before the longer explanation appears. Long
+    /// enough that skimming the panel does not fill the screen with prose.
+    const DWELL: f64 = 1.1;
+
+    let key = resp.id.with("tip_dwell");
+    resp.on_hover_ui(|ui| {
+        let now = ui.input(|i| i.time);
+        let start = ui.ctx().data_mut(|d| {
+            let e: &mut (f64, f64) = d.get_temp_mut_or(key, (now, now));
+            // A gap means the pointer left and came back, so the dwell restarts.
+            if now - e.1 > 0.25 {
+                *e = (now, now);
+            }
+            e.1 = now;
+            e.0
+        });
+        ui.set_max_width(340.0);
+        ui.label(short);
+        if now - start > DWELL {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.label(egui::RichText::new(long).weak());
+        } else {
+            // Keep repainting, so the second stage arrives on its own rather
+            // than waiting for the pointer to move.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+        }
+    })
 }
 
 fn gray_to_rgb(img: &Gray) -> Vec<u8> {
@@ -683,6 +909,14 @@ impl eframe::App for App {
                 });
             });
 
+        // Sampled on a timer rather than per frame: the CPU figure is an average
+        // over the interval since the last read, so reading it too often just
+        // makes it noisy.
+        if self.usage_sampled.elapsed() > std::time::Duration::from_millis(500) {
+            self.usage = self.usage_monitor.sample();
+            self.usage_sampled = std::time::Instant::now();
+        }
+
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if let Some(p) = &self.pipeline {
@@ -695,6 +929,21 @@ impl eframe::App for App {
                 } else {
                     ui.label("stopped");
                 }
+                ui.separator();
+                tip(
+                    ui.label(format!(
+                        "{:.0} MB | cpu {:.0}% | {} threads",
+                        self.usage.rss_mb, self.usage.cpu_percent, self.usage.threads
+                    )),
+                    "Memory and processor use by this program.",
+                    "Memory is what is actually held in RAM, dominated by the matching \
+                     workspace and the map. Processor use is given as a share of one \
+                     core, so on an eight-thread machine 800% would mean everything is \
+                     busy - above 100% simply means several threads are working at \
+                     once, which is expected here. There is no graphics figure: the \
+                     display does almost nothing, and every stage worth watching runs \
+                     on the processor.",
+                );
                 if let Some(f) = &self.last {
                     ui.separator();
                     ui.label(format!("frame {} | {}x{}", f.seq, f.left.w, f.left.h));

@@ -124,6 +124,11 @@ classDiagram
         reproject()
         draw()
     }
+    class sysinfo {
+        Usage
+        UsageMonitor
+        sample()
+    }
     class colormap {
         Palette
         Range
@@ -142,6 +147,7 @@ classDiagram
     app --> pipeline
     app --> colormap
     app --> cloud
+    app --> sysinfo
     cloud --> colormap
     app --> align
     pipeline --> camera

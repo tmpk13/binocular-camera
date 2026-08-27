@@ -10,6 +10,7 @@ mod image;
 mod odometry;
 mod pipeline;
 mod stereo;
+mod sysinfo;
 mod voxelmap;
 
 use pipeline::ProcSettings;

@@ -256,8 +256,7 @@ impl VoxelMap {
         for dz in -1..=1i32 {
             for dy in -1..=1i32 {
                 for dx in -1..=1i32 {
-                    let n = [dx, dy, dz];
-                    let Some(v) = self.voxels.get(&[k[0] + n[0], k[1] + n[1], k[2] + n[2]]) else {
+                    let Some(v) = self.voxels.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) else {
                         continue;
                     };
                     if v.log_odds < min_log_odds || v.hits == 0 {
@@ -435,14 +434,6 @@ mod tests_support {
 mod tests {
     pub use super::tests_support::*;
     use super::*;
-
-    fn point(pos: [f32; 3]) -> Point {
-        Point {
-            pos,
-            scalar: 0.0,
-            gray: 128,
-        }
-    }
 
     fn params() -> MapParams {
         MapParams {

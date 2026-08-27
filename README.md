@@ -28,6 +28,14 @@ binocular-camera bench 20         # time the matcher at each downscale factor
 
 `shot` and `bench` accept `--disparities N`, `--downscale N` and `--paths8`.
 
+## Tooltips
+
+Every control has a two-stage tooltip. Hover briefly for a one-line summary of
+what it does; keep the pointer still a moment longer and a plain-language
+explanation appears *below* it, without jargon and without repeating the
+summary. The second stage adds to the first rather than replacing it, so knowing
+the term already does not mean re-reading it to reach the detail.
+
 ## The controls that matter
 
 **Swap left/right halves** decides which half of the frame holds the physically
@@ -192,8 +200,13 @@ the CPU near 1.4 GHz and made every figure above roughly three times worse.
 `cargo run --release` matters - the debug profile is far too slow to interact
 with, though dependencies are optimized even in dev builds to soften that.
 
-The status bar reports capture rate, match rate, decode and match times, and
-`lag` - how old the displayed frame is. Frames the camera delivers while the
+The status bar reports capture rate, match rate, decode and match times, `lag`
+(how old the displayed frame is), and process memory, CPU and thread count. CPU
+is a share of *one* core, so above 100% simply means several threads are busy.
+
+There is no GPU figure, deliberately. Linux offers no vendor-neutral way to read
+GPU utilization, and it would measure almost nothing here - rendering is one
+texture upload per frame and every stage worth watching runs on the CPU. Frames the camera delivers while the
 matcher is busy are counted as `skipped`; they are discarded before being
 decoded, so they cost almost nothing and the capture rate settles to the match
 rate on its own.
