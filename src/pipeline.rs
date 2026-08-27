@@ -17,7 +17,7 @@ use crate::cloud;
 use crate::image::Gray;
 use crate::odometry::{Odometry, OdometryParams, Pose, Report};
 use crate::stereo::{match_stereo, Disparity, MatchStats, StereoParams};
-use crate::voxelmap::{MapParams, VoxelMap};
+use crate::voxelmap::{IcpParams, IcpReport, MapParams, VoxelMap};
 
 /// A one-deep mailbox. Writing replaces whatever was pending.
 struct Slot<T> {
@@ -79,6 +79,10 @@ pub struct ProcSettings {
     pub geometry: Geometry,
     pub odometry: OdometryParams,
     pub map: MapParams,
+    pub icp: IcpParams,
+    /// Align each frame to the map already built, rather than only to the
+    /// previous frame.
+    pub frame_to_model: bool,
 }
 
 impl Default for ProcSettings {
@@ -91,6 +95,8 @@ impl Default for ProcSettings {
             geometry: Geometry::default(),
             odometry: OdometryParams::default(),
             map: MapParams::default(),
+            icp: IcpParams::default(),
+            frame_to_model: true,
         }
     }
 }
@@ -111,6 +117,8 @@ pub struct FrameResult {
     pub odometry: Report,
     pub odometry_ms: f32,
     pub map_ms: f32,
+    pub icp: IcpReport,
+    pub icp_used: bool,
 }
 
 #[derive(Clone, Default)]
@@ -261,23 +269,49 @@ impl Pipeline {
                         }
                         let mut odometry_ms = 0.0;
                         let mut map_ms = 0.0;
+                        let mut icp_report = IcpReport::default();
+                        let mut icp_used = false;
                         if cfg.mapping {
                             let t = Instant::now();
                             let moved = odom
                                 .track(&left, &disp, &cfg.geometry, &cfg.odometry)
                                 .is_some();
                             odometry_ms = t.elapsed().as_secs_f32() * 1000.0;
-                            // Only fuse when the pose is trusted; integrating a
-                            // frame at a wrong pose smears the map permanently.
-                            if moved {
+
+                            let pts =
+                                cloud::reproject(&disp, &left, &cfg.geometry, cfg.map.max_range_m);
+
+                            // Corner tracking supplies a seed; aligning to the
+                            // map corrects it. Where a surface has few corners
+                            // the alignment can carry the pose by itself, which
+                            // is what keeps low-texture scenes trackable at all.
+                            let mut pose = odom.pose;
+                            let mut first = false;
+                            if cfg.frame_to_model && !pts.is_empty() {
                                 let t = Instant::now();
-                                let pts = cloud::reproject(
-                                    &disp,
-                                    &left,
-                                    &cfg.geometry,
-                                    cfg.map.max_range_m,
-                                );
-                                map.lock().unwrap().integrate(&pts, &odom.pose, &cfg.map);
+                                let fit = {
+                                    let m = map.lock().unwrap();
+                                    first = m.is_empty();
+                                    m.register(&pts, pose, &cfg.icp)
+                                };
+                                odometry_ms += t.elapsed().as_secs_f32() * 1000.0;
+                                if let Some((refined, rep)) = fit {
+                                    pose = refined;
+                                    icp_report = rep;
+                                    icp_used = true;
+                                    // Carry the correction forward, so the next
+                                    // frame-to-frame step starts from the
+                                    // corrected pose rather than the drifting one.
+                                    odom.set_pose(refined);
+                                }
+                            }
+
+                            // Fuse only at a pose something vouched for;
+                            // integrating at a wrong one smears the map
+                            // permanently.
+                            if moved || icp_used || first {
+                                let t = Instant::now();
+                                map.lock().unwrap().integrate(&pts, &pose, &cfg.map);
                                 map_ms = t.elapsed().as_secs_f32() * 1000.0;
                             }
                         } else if !odom.pose_is_identity() {
@@ -299,6 +333,8 @@ impl Pipeline {
                             odometry: odom.report,
                             odometry_ms,
                             map_ms,
+                            icp: icp_report,
+                            icp_used,
                         });
                         wake();
                     }

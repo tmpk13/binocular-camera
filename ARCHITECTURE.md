@@ -22,9 +22,11 @@ flowchart TD
         GATE["contrast gate<br/>reject untextured pixels"]
         CLEAN["despeckle + 3x3 median"]
         ODOM["visual odometry<br/>corners, patch track,<br/>RANSAC + Horn fit"]
+        ICP["align to map<br/>corrects the seed pose"]
         FUSE["voxel map<br/>log-odds + running mean"]
         TRIM --> DOWN --> CENSUS --> COST --> SGM --> WTA --> GATE --> CLEAN
-        CLEAN --> ODOM --> FUSE
+        CLEAN --> ODOM --> ICP --> FUSE
+        FUSE -.->|"model to align against"| ICP
     end
 
     subgraph ui["main thread"]
@@ -109,8 +111,11 @@ classDiagram
     class voxelmap {
         VoxelMap
         MapParams
+        IcpParams
         integrate()
+        register()
         to_points()
+        write_ply()
     }
     class cloud {
         Point

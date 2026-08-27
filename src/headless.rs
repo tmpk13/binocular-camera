@@ -649,3 +649,158 @@ pub fn odometry_test(frames: usize, settings: ProcSettings) -> Result<()> {
     println!("error that accumulates whether or not anything actually moved.");
     Ok(())
 }
+
+/// Run a full mapping session over a burst of frames and report what came out.
+///
+/// The point of the comparison is drift. Frame-to-frame tracking compounds its
+/// own error; aligning to the accumulated model should not. Running the same
+/// frames both ways is the only way to see which is true for a given scene.
+pub fn map_session(frames: usize, settings: ProcSettings, out: Option<&str>) -> Result<()> {
+    let devices = list_capture_devices();
+    let (path, _) = devices
+        .iter()
+        .find(|(p, _)| probe_modes(p).map(|m| !m.is_empty()).unwrap_or(false))
+        .ok_or_else(|| anyhow!("no device with side-by-side MJPEG modes"))?;
+    let modes = probe_modes(path)?;
+    let mode = modes
+        .iter()
+        .find(|m| m.full_w <= 2560 && m.full_h >= 720)
+        .copied()
+        .unwrap_or(modes[0]);
+    let cfg = CameraConfig {
+        path: path.clone(),
+        mode,
+        swap_lr: DEFAULT_SWAP_LR,
+    };
+    println!("capturing {frames} frames...");
+    let stack = grab_many(cfg, frames, 10)?;
+
+    // Match once; both runs then see identical input, so any difference is the
+    // tracking strategy rather than the scene changing underneath.
+    let prepared: Vec<(Gray, crate::stereo::Disparity)> = stack
+        .iter()
+        .map(|f| {
+            let left = f.left.downscale(settings.downscale);
+            let right = f
+                .right
+                .shift_vertical(settings.align.dy)
+                .downscale(settings.downscale);
+            let (disp, _) = match_stereo(&left, &right, &settings.stereo);
+            (left, disp)
+        })
+        .collect();
+
+    println!();
+    println!("mode              frames  voxels   path(m)  net(m)   align");
+    let mut last_map: Option<VoxelMap> = None;
+    for frame_to_model in [false, true] {
+        let mut odom = Odometry::default();
+        let mut map = VoxelMap::default();
+        let mut aligned = 0usize;
+        let mut icp_ms = 0.0f32;
+        // Measured from the pose sequence rather than the odometry counter,
+        // which only advances on frame-to-frame steps and so reads zero when
+        // alignment is carrying the pose by itself.
+        let mut path = 0.0f32;
+        let mut prev_pose: Option<crate::odometry::Pose> = None;
+
+        for (left, disp) in &prepared {
+            let moved = odom
+                .track(left, disp, &settings.geometry, &settings.odometry)
+                .is_some();
+            let pts = cloud::reproject(disp, left, &settings.geometry, settings.map.max_range_m);
+            let mut pose = odom.pose;
+            let mut used = false;
+            let first = map.is_empty();
+            if frame_to_model && !pts.is_empty() {
+                let t = Instant::now();
+                let fit = map.register(&pts, pose, &settings.icp);
+                icp_ms += t.elapsed().as_secs_f32() * 1000.0;
+                if let Some((refined, _)) = fit {
+                    pose = refined;
+                    used = true;
+                    aligned += 1;
+                    odom.set_pose(refined);
+                }
+            }
+            if moved || used || first {
+                map.integrate(&pts, &pose, &settings.map);
+                if let Some(pp) = prev_pose {
+                    path += pp.inverse().then(&pose).translation_norm();
+                }
+                prev_pose = Some(pose);
+            }
+        }
+        println!(
+            "{:<16}  {:>6}  {:>6}  {:>7.3}  {:>6.3}  {:>4} frames ({:.1} ms)",
+            if frame_to_model {
+                "frame-to-model"
+            } else {
+                "frame-to-frame"
+            },
+            map.frames,
+            map.len(),
+            path,
+            odom.pose.translation_norm(),
+            aligned,
+            icp_ms / prepared.len().max(1) as f32
+        );
+        last_map = Some(map);
+    }
+
+    println!();
+    println!("Held still, path length is drift. Frame-to-model should show less");
+    println!("of it, because the model it aligns to averages many observations.");
+
+    let Some(map) = last_map else { return Ok(()) };
+    if let Some(dest) = out {
+        let n = map.write_ply(dest, settings.icp.min_log_odds)?;
+        println!();
+        println!("wrote {n} points to {dest}");
+    }
+
+    // Render the accumulated map, which is the only real check that it is a map
+    // rather than one frame repeated at slightly wrong poses.
+    let pts = map.to_points(settings.icp.min_log_odds);
+    if pts.is_empty() {
+        return Ok(());
+    }
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for p in &pts {
+        lo = lo.min(p.pos[1]);
+        hi = hi.max(p.pos[1]);
+    }
+    let height = Range {
+        lo,
+        hi: hi.max(lo + 0.1),
+    };
+    let mz = cloud::median_depth(&pts);
+    let (w, h) = (640usize, 480usize);
+    let mut renderer = cloud::Renderer::default();
+    for (name, yaw, pitch) in [
+        ("front", 0.0f32, 0.0f32),
+        ("left40", -0.7, 0.15),
+        ("above", 0.0, 0.9),
+    ] {
+        let orbit = Orbit {
+            yaw,
+            pitch,
+            ..Orbit::facing(mz)
+        };
+        let rgb = renderer.draw(
+            w,
+            h,
+            &pts,
+            &orbit,
+            CloudColor::Height,
+            Palette::Turbo,
+            height,
+            height,
+            2,
+            false,
+        );
+        write_ppm(&format!("mapview-{name}.ppm"), rgb, w, h)?;
+    }
+    println!("wrote mapview-{{front,left40,above}}.ppm");
+    Ok(())
+}

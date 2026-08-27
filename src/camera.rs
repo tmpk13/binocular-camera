@@ -84,7 +84,7 @@ pub struct CameraConfig {
 /// concluding the matcher is broken. Kept as one named constant because the
 /// headless tools and the viewer must agree; if they disagree, `shot` stops
 /// being usable for diagnosing what the viewer shows.
-pub const DEFAULT_SWAP_LR: bool = false;
+pub const DEFAULT_SWAP_LR: bool = true;
 
 /// Enumerate the MJPEG modes a device offers, best framerate first per size.
 pub fn probe_modes(path: &str) -> Result<Vec<CaptureMode>> {

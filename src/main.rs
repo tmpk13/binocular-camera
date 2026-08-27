@@ -25,6 +25,7 @@ binocular-camera - live stereo depth viewer
   binocular-camera stability [N]   measure frame-to-frame disparity flicker
   binocular-camera cloud [PREFIX]  render the point cloud from several angles
   binocular-camera odom [N]        run visual odometry over N frames, report drift
+  binocular-camera map [N]         map N frames both ways, compare drift, write PLY
 
 Options for shot/bench:
   --disparities N   disparity search width (default 64)
@@ -105,6 +106,10 @@ fn main() -> anyhow::Result<()> {
                 !flag("--no-align"),
                 value("--exposure").map(|v| v as i64),
             )
+        }
+        Some("map") => {
+            let n = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40usize);
+            headless::map_session(n.clamp(4, 300), settings, Some("map.ply"))
         }
         Some("odom") => {
             let n = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40usize);

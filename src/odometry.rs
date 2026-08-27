@@ -453,6 +453,12 @@ impl Odometry {
         *self = Self::default();
     }
 
+    /// Adopt a pose corrected elsewhere, so the next frame-to-frame step builds
+    /// on the corrected estimate rather than the drifting one.
+    pub fn set_pose(&mut self, pose: Pose) {
+        self.pose = pose;
+    }
+
     pub fn pose_is_identity(&self) -> bool {
         self.pose.translation_norm() < 1e-6 && self.distance_travelled < 1e-6
     }

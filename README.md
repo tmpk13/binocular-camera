@@ -98,16 +98,52 @@ surfaces are smoothed by averaging rather than snapped to the grid.
 Colour by **Height** rather than Depth once the view is rotated - it is what
 separates floor, walls and clutter.
 
-### This is not full SLAM, and it drifts
+### Frame-to-model is what makes it work
+
+**Align to map (frame-to-model)** registers each frame against the map already
+built, not just against the previous frame. This is the difference between a map
+and a smear. Frame-to-frame error compounds every step; the map is an average of
+many observations, so aligning to it corrects error instead of accumulating it.
+
+On an office scene of plain partitions and painted walls, measured over 50
+frames with `binocular-camera map 50`:
+
+| Tracking | Frames fused | Voxels | Net drift |
+|---|---|---|---|
+| frame-to-frame | 1 | 8k | - |
+| frame-to-model | 50 | 176k | 33 mm |
+
+Frame-to-frame did not merely drift, it failed outright: the scene yielded 9
+corners, of which 0 survived as inliers, so no pose was ever produced and only
+the first frame was ever fused. Alignment to the map carries the pose where
+corner tracking has nothing to work with, which is most indoor surfaces.
+
+Alignment costs 1-5 ms per frame depending on point count.
+
+### Density: let the map do the filtering
+
+**Min contrast** exists because census matching returns a confident answer from
+sensor noise on a blank surface. That gate is right for the live depth view,
+which has no way to check a match against anything else. It is too strict for
+mapping, where log-odds fusion and free-space carving already reject points that
+later frames disagree with.
+
+Lowering it from 4 to 0 on the same scene gave 5.5x the map density
+(23k to 129k voxels) for 11 mm more drift. If you are mapping, turn it down.
+
+**Save PLY** writes the confident part of the map as a binary PLY point cloud.
+
+### It still drifts, and it is still not full SLAM
 
 Tracking is frame to frame. There is no place recognition and no pose graph, so
 error accumulates and coming back to somewhere you have already been will not
 line up with the first visit.
 
-Measure the drift yourself before trusting a map:
+Measure it yourself before trusting a map:
 
 ```sh
-binocular-camera odom 40
+binocular-camera map 40    # runs the same frames both ways and compares
+binocular-camera odom 40   # frame-to-frame only, in detail
 ```
 
 Hold the camera still and run it. Every millimetre reported is error. On a

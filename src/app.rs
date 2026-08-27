@@ -547,6 +547,13 @@ impl App {
         .on_hover_text("Changing this clears the map; the keys are resolution-dependent.");
         ui.add(egui::Slider::new(&mut s.map.max_range_m, 0.5..=15.0).text("Map range m"))
             .on_hover_text("Far points carry the most depth error, so they are worth excluding.");
+        ui.checkbox(&mut s.frame_to_model, "Align to map (frame-to-model)")
+            .on_hover_text(
+                "Register each frame against the map already built instead of \
+                 only against the previous frame. Frame-to-frame error compounds \
+                 every step; the map is an average of many observations, so \
+                 aligning to it corrects error rather than accumulating it.",
+            );
         ui.checkbox(&mut s.map.carve_free, "Carve free space")
             .on_hover_text("Let rays that pass through a voxel argue away earlier bad returns.");
         ui.add(egui::Slider::new(&mut self.min_confidence, -1.0..=3.0).text("Min confidence"))
@@ -714,6 +721,15 @@ impl eframe::App for App {
                             ),
                         )
                         .on_hover_text("inliers / tracked / detected corners");
+                        ui.separator();
+                        if f.icp_used {
+                            ui.label(format!(
+                                "align {} pairs, {:.0} mm rms, corrected {:.0} mm",
+                                f.icp.pairs, f.icp.rms_mm, f.icp.correction_mm
+                            ));
+                        } else {
+                            ui.label("align off");
+                        }
                         ui.separator();
                         ui.label(format!(
                             "map {} voxels, {} frames | fuse {:.0} ms",
