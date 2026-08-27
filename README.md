@@ -32,8 +32,9 @@ binocular-camera bench 20         # time the matcher at each downscale factor
 
 **Swap left/right halves** decides which half of the frame holds the physically
 left sensor. Get it wrong and the depth map is almost entirely empty rather than
-visibly inverted, so it is the first thing to try if nothing appears. The default
-matches the camera this was developed against.
+visibly inverted, so it is the first thing to try if nothing appears - it costs
+one click to rule out. The default lives in `camera::DEFAULT_SWAP_LR`, and the
+headless tools use the same value so their output matches the viewer's.
 
 **Downscale** is the main speed dial - cost grows roughly with the cube of
 resolution. **Disparities** sets how close an object can be and still be matched;
@@ -83,6 +84,47 @@ spikes along the viewing direction while near ones stay compact. That is the
 measurement's real uncertainty becoming visible, not a rendering artifact.
 **Max distance** trims the far points, which are both the least reliable and the
 most visually dominant.
+
+## Mapping
+
+**Mapping** in the sidebar turns on visual odometry and folds each frame into a
+probabilistic voxel map, viewable under the **Map** view. Every observation is
+evidence rather than truth: a voxel accumulates log-odds of being occupied, so a
+surface seen repeatedly becomes confident while a one-frame mismatch stays weak.
+**Carve free space** lets rays that pass through a voxel argue away earlier bad
+returns. Each voxel also keeps a running mean of the points inside it, so
+surfaces are smoothed by averaging rather than snapped to the grid.
+
+Colour by **Height** rather than Depth once the view is rotated - it is what
+separates floor, walls and clutter.
+
+### This is not full SLAM, and it drifts
+
+Tracking is frame to frame. There is no place recognition and no pose graph, so
+error accumulates and coming back to somewhere you have already been will not
+line up with the first visit.
+
+Measure the drift yourself before trusting a map:
+
+```sh
+binocular-camera odom 40
+```
+
+Hold the camera still and run it. Every millimetre reported is error. On a
+textured indoor scene expect roughly 10-25 mm of apparent motion per frame, and
+note the gap between *path length* and *net displacement* - the error is close
+to zero-mean, so it wanders rather than marching off in one direction.
+
+Three things dominate map quality, in order:
+
+1. **Texture.** Blank walls give the tracker nothing. The status bar shows
+   `track inliers/tracked/detected`; below about 15 inliers the pose is a guess
+   and frames are rejected rather than fused at a wrong pose.
+2. **Calibration.** Lens distortion is unmodelled and the baseline and focal
+   length are nominal, so points are systematically misplaced. This is the
+   ceiling on everything else.
+3. **Motion.** Move slowly. Large jumps between frames break patch tracking,
+   and a rejected frame is better than a smeared map.
 
 ## Distances are estimates
 

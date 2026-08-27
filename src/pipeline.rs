@@ -11,10 +11,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::align::{estimate_vertical_offset, Alignment};
+use crate::align::{estimate_vertical_offset, Alignment, Geometry};
 use crate::camera::{run_capture, CameraConfig, StereoFrame};
+use crate::cloud;
 use crate::image::Gray;
+use crate::odometry::{Odometry, OdometryParams, Pose, Report};
 use crate::stereo::{match_stereo, Disparity, MatchStats, StereoParams};
+use crate::voxelmap::{MapParams, VoxelMap};
 
 /// A one-deep mailbox. Writing replaces whatever was pending.
 struct Slot<T> {
@@ -70,6 +73,12 @@ pub struct ProcSettings {
     pub downscale: usize,
     pub stereo: StereoParams,
     pub align: Alignment,
+    /// Track camera motion and fold frames into the map. Off by default: it
+    /// costs real time and is only meaningful once the camera moves.
+    pub mapping: bool,
+    pub geometry: Geometry,
+    pub odometry: OdometryParams,
+    pub map: MapParams,
 }
 
 impl Default for ProcSettings {
@@ -78,6 +87,10 @@ impl Default for ProcSettings {
             downscale: 2,
             stereo: StereoParams::default(),
             align: Alignment::default(),
+            mapping: false,
+            geometry: Geometry::default(),
+            odometry: OdometryParams::default(),
+            map: MapParams::default(),
         }
     }
 }
@@ -93,6 +106,11 @@ pub struct FrameResult {
     /// displayed depth map actually is.
     pub latency_ms: f32,
     pub seq: u64,
+    /// Camera-to-world pose at this frame, when tracking is running.
+    pub pose: Pose,
+    pub odometry: Report,
+    pub odometry_ms: f32,
+    pub map_ms: f32,
 }
 
 #[derive(Clone, Default)]
@@ -135,6 +153,8 @@ pub struct Pipeline {
     status: Arc<Mutex<Status>>,
     align_request: Arc<AtomicBool>,
     align_applied: Arc<AtomicU64>,
+    map: Arc<Mutex<VoxelMap>>,
+    map_reset: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -154,6 +174,8 @@ impl Pipeline {
         let status = Arc::new(Mutex::new(Status::default()));
         let align_request = Arc::new(AtomicBool::new(false));
         let align_applied = Arc::new(AtomicU64::new(0));
+        let map: Arc<Mutex<VoxelMap>> = Arc::new(Mutex::new(VoxelMap::default()));
+        let map_reset = Arc::new(AtomicBool::new(false));
 
         let capture = {
             let (stop, swap_lr, raw, status) =
@@ -198,10 +220,12 @@ impl Pipeline {
                 align_request.clone(),
                 align_applied.clone(),
             );
+            let (map, map_reset) = (map.clone(), map_reset.clone());
             std::thread::Builder::new()
                 .name("stereo".into())
                 .spawn(move || {
                     let mut rate = Rate::new();
+                    let mut odom = Odometry::default();
                     while let Some(frame) = raw.take_blocking(&stop) {
                         let cfg = settings.lock().unwrap().clone();
 
@@ -227,6 +251,39 @@ impl Pipeline {
                         }
 
                         let (disp, stats) = match_stereo(&left, &right, &cfg.stereo);
+
+                        // Tracking and fusion live here rather than on the UI
+                        // thread: both scale with the frame, and the viewer must
+                        // stay responsive while they run.
+                        if map_reset.swap(false, Ordering::Relaxed) {
+                            odom.reset();
+                            map.lock().unwrap().clear();
+                        }
+                        let mut odometry_ms = 0.0;
+                        let mut map_ms = 0.0;
+                        if cfg.mapping {
+                            let t = Instant::now();
+                            let moved = odom
+                                .track(&left, &disp, &cfg.geometry, &cfg.odometry)
+                                .is_some();
+                            odometry_ms = t.elapsed().as_secs_f32() * 1000.0;
+                            // Only fuse when the pose is trusted; integrating a
+                            // frame at a wrong pose smears the map permanently.
+                            if moved {
+                                let t = Instant::now();
+                                let pts = cloud::reproject(
+                                    &disp,
+                                    &left,
+                                    &cfg.geometry,
+                                    cfg.map.max_range_m,
+                                );
+                                map.lock().unwrap().integrate(&pts, &odom.pose, &cfg.map);
+                                map_ms = t.elapsed().as_secs_f32() * 1000.0;
+                            }
+                        } else if !odom.pose_is_identity() {
+                            odom.reset();
+                        }
+
                         let fps = rate.tick();
                         status.lock().unwrap().process_fps = fps;
 
@@ -238,6 +295,10 @@ impl Pipeline {
                             decode_ms: frame.decode_ms,
                             latency_ms: frame.captured.elapsed().as_secs_f32() * 1000.0,
                             seq: frame.seq,
+                            pose: odom.pose,
+                            odometry: odom.report,
+                            odometry_ms,
+                            map_ms,
                         });
                         wake();
                     }
@@ -253,6 +314,8 @@ impl Pipeline {
             status,
             align_request,
             align_applied,
+            map,
+            map_reset,
             threads: vec![capture, worker],
         }
     }
@@ -286,6 +349,15 @@ impl Pipeline {
     /// knows to re-read settings it would otherwise consider its own to own.
     pub fn align_generation(&self) -> u64 {
         self.align_applied.load(Ordering::Relaxed)
+    }
+
+    pub fn map(&self) -> &Arc<Mutex<VoxelMap>> {
+        &self.map
+    }
+
+    /// Drop the map and the accumulated trajectory.
+    pub fn reset_map(&self) {
+        self.map_reset.store(true, Ordering::Relaxed);
     }
 }
 

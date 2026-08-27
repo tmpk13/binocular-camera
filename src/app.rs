@@ -5,11 +5,12 @@ use eframe::egui;
 use crate::align::Geometry;
 use crate::camera::{
     apply_exposure, current_exposure, exposure_ranges, list_capture_devices, probe_modes,
-    CameraConfig, CaptureMode, ControlRange, Exposure,
+    CameraConfig, CaptureMode, ControlRange, Exposure, DEFAULT_SWAP_LR,
 };
 use crate::cloud::{self, CloudColor, Orbit, Point};
 use crate::colormap::{anaglyph, auto_range, colorize, Palette, Range, RangeTracker};
 use crate::image::Gray;
+use crate::odometry::Pose;
 use crate::pipeline::{FrameResult, Pipeline, ProcSettings};
 use crate::stereo::PathCount;
 
@@ -17,15 +18,17 @@ use crate::stereo::PathCount;
 enum ViewMode {
     Depth,
     Cloud,
+    Map,
     Left,
     Right,
     Anaglyph,
 }
 
 impl ViewMode {
-    const ALL: [ViewMode; 5] = [
+    const ALL: [ViewMode; 6] = [
         ViewMode::Depth,
         ViewMode::Cloud,
+        ViewMode::Map,
         ViewMode::Left,
         ViewMode::Right,
         ViewMode::Anaglyph,
@@ -35,6 +38,7 @@ impl ViewMode {
         match self {
             ViewMode::Depth => "Depth",
             ViewMode::Cloud => "Point cloud",
+            ViewMode::Map => "Map",
             ViewMode::Left => "Left",
             ViewMode::Right => "Right",
             ViewMode::Anaglyph => "Anaglyph",
@@ -70,6 +74,15 @@ pub struct App {
     cloud_max_depth: f32,
     cloud_renderer: cloud::Renderer,
     cloud_color: CloudColor,
+    map_points: Vec<Point>,
+    map_version: u64,
+    map_rebuilt: std::time::Instant,
+    map_height: Range,
+    cloud_height: Range,
+    map_stats: (usize, u64),
+    map_empty: bool,
+    min_confidence: f32,
+    pose: Pose,
     point_size: u32,
     max_depth_m: f32,
     show_frustum: bool,
@@ -80,18 +93,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, settings: ProcSettings) -> Self {
         let devices = list_capture_devices();
         let mut app = Self {
             devices,
             device_idx: 0,
             modes: Vec::new(),
             mode_idx: 0,
-            // The attached module carries the physically-left sensor in the
-            // right half of the frame; without this every disparity is negative.
-            swap_lr: true,
+            swap_lr: DEFAULT_SWAP_LR,
             pipeline: None,
-            settings: ProcSettings::default(),
+            settings,
             align_gen: 0,
             view: ViewMode::Depth,
             palette: Palette::Turbo,
@@ -116,6 +127,15 @@ impl App {
             cloud_max_depth: 0.0,
             cloud_renderer: cloud::Renderer::default(),
             cloud_color: CloudColor::Depth,
+            map_points: Vec::new(),
+            map_version: u64::MAX,
+            map_rebuilt: std::time::Instant::now(),
+            map_height: Range { lo: 0.0, hi: 1.0 },
+            cloud_height: Range { lo: 0.0, hi: 1.0 },
+            map_stats: (0, 0),
+            map_empty: true,
+            min_confidence: 0.85,
+            pose: Pose::IDENTITY,
             point_size: 2,
             max_depth_m: 10.0,
             show_frustum: true,
@@ -201,9 +221,11 @@ impl App {
     fn render_view(&self, frame: &FrameResult, range: Range) -> (Vec<u8>, usize, usize) {
         let (w, h) = (frame.left.w, frame.left.h);
         let rgb = match self.view {
-            // Cloud is rendered by its own path; this arm only keeps the match
-            // exhaustive.
-            ViewMode::Depth | ViewMode::Cloud => colorize(&frame.disp, range, self.palette),
+            // Cloud and Map are rendered by their own path; this arm only keeps
+            // the match exhaustive.
+            ViewMode::Depth | ViewMode::Cloud | ViewMode::Map => {
+                colorize(&frame.disp, range, self.palette)
+            }
             ViewMode::Left => gray_to_rgb(&frame.left),
             ViewMode::Right => gray_to_rgb(&frame.right),
             ViewMode::Anaglyph => anaglyph(&frame.left, &frame.right),
@@ -211,13 +233,46 @@ impl App {
         (rgb, w, h)
     }
 
-    /// Render the cloud and handle orbit/pan/zoom.
+    /// Pull a fresh set of points out of the map when it has moved on.
     ///
-    /// The 3D points are rebuilt only when a new frame arrives or the geometry
-    /// changes, so dragging re-renders from a cached cloud rather than
-    /// reprojecting every mouse move.
-    fn show_cloud(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, range: Range) {
-        if let Some(frame) = &self.last {
+    /// Rebuilding walks every voxel, so it is throttled rather than done per
+    /// frame; the map changes far more slowly than the camera does.
+    fn refresh_map(&mut self) {
+        let Some(p) = &self.pipeline else { return };
+        let due = self.map_rebuilt.elapsed() > std::time::Duration::from_millis(250);
+        let map = p.map().lock().unwrap();
+        if map.version == self.map_version || !due {
+            return;
+        }
+        self.map_version = map.version;
+        self.map_rebuilt = std::time::Instant::now();
+        self.map_points = map.to_points(self.min_confidence);
+        let (lo, hi) = map.height_range(self.min_confidence);
+        self.map_height = Range { lo, hi };
+        self.map_stats = (map.len(), map.frames);
+        self.map_empty = map.is_empty();
+    }
+
+    /// Render a point set and handle orbit/pan/zoom.
+    ///
+    /// The live cloud is rebuilt only when a new frame arrives and the map only
+    /// when it changes, so dragging re-renders from cached points rather than
+    /// recomputing them on every mouse move.
+    fn show_points(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, range: Range) {
+        let is_map = self.view == ViewMode::Map;
+        if is_map {
+            self.refresh_map();
+            if self.map_empty {
+                ui.centered_and_justified(|ui| {
+                    ui.label(if self.settings.mapping {
+                        "map is empty - move the camera slowly to start tracking"
+                    } else {
+                        "enable Mapping to start building a map"
+                    });
+                });
+                return;
+            }
+        } else if let Some(frame) = &self.last {
             let stale = frame.seq != self.cloud_seq
                 || self.cloud_geom != self.geometry
                 || self.cloud_max_depth != self.max_depth_m;
@@ -227,6 +282,19 @@ impl App {
                 self.cloud_max_depth = self.max_depth_m;
                 self.cloud =
                     cloud::reproject(&frame.disp, &frame.left, &self.geometry, self.max_depth_m);
+                let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                for p in &self.cloud {
+                    lo = lo.min(p.pos[1]);
+                    hi = hi.max(p.pos[1]);
+                }
+                self.cloud_height = if lo > hi {
+                    Range { lo: 0.0, hi: 1.0 }
+                } else {
+                    Range {
+                        lo,
+                        hi: hi.max(lo + 0.1),
+                    }
+                };
                 if !self.orbit_framed && !self.cloud.is_empty() {
                     self.orbit = Orbit::facing(cloud::median_depth(&self.cloud));
                     self.orbit_framed = true;
@@ -245,16 +313,22 @@ impl App {
         let (w, h) = ((w as usize).max(64), (h as usize).max(64));
 
         let image = {
+            let (points, height) = if is_map {
+                (&self.map_points, self.map_height)
+            } else {
+                (&self.cloud, self.cloud_height)
+            };
             let rgb = self.cloud_renderer.draw(
                 w,
                 h,
-                &self.cloud,
+                points,
                 &self.orbit,
                 self.cloud_color,
                 self.palette,
                 range,
+                height,
                 self.point_size,
-                self.show_frustum,
+                self.show_frustum && !is_map,
             );
             egui::ColorImage::from_rgb([w, h], rgb)
         };
@@ -457,6 +531,39 @@ impl App {
             }
         });
 
+        ui.separator();
+        ui.heading("Mapping");
+        ui.checkbox(&mut s.mapping, "Track and build map")
+            .on_hover_text(
+                "Estimates camera motion between frames and folds each frame into a \
+             voxel map. Frame-to-frame only, so the trajectory drifts and \
+             revisiting a place will not line up.",
+            );
+        ui.add(
+            egui::Slider::new(&mut s.map.voxel_size, 0.005..=0.20)
+                .text("Voxel m")
+                .logarithmic(true),
+        )
+        .on_hover_text("Changing this clears the map; the keys are resolution-dependent.");
+        ui.add(egui::Slider::new(&mut s.map.max_range_m, 0.5..=15.0).text("Map range m"))
+            .on_hover_text("Far points carry the most depth error, so they are worth excluding.");
+        ui.checkbox(&mut s.map.carve_free, "Carve free space")
+            .on_hover_text("Let rays that pass through a voxel argue away earlier bad returns.");
+        ui.add(egui::Slider::new(&mut self.min_confidence, -1.0..=3.0).text("Min confidence"))
+            .on_hover_text("Log-odds a voxel needs before it is drawn.");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(running, egui::Button::new("Reset map"))
+                .clicked()
+            {
+                if let Some(p) = &self.pipeline {
+                    p.reset_map();
+                }
+                self.map_points.clear();
+                self.map_version = u64::MAX;
+            }
+        });
+
         if s != self.settings {
             self.settings = s;
             if let Some(p) = &self.pipeline {
@@ -480,11 +587,11 @@ impl App {
                     ui.selectable_value(&mut self.palette, p, p.label());
                 }
             });
-        if self.view == ViewMode::Cloud {
+        if matches!(self.view, ViewMode::Cloud | ViewMode::Map) {
             egui::ComboBox::from_id_salt("cloudcolor")
                 .selected_text(self.cloud_color.label())
                 .show_ui(ui, |ui| {
-                    for c in [CloudColor::Depth, CloudColor::Image] {
+                    for c in CloudColor::ALL {
                         ui.selectable_value(&mut self.cloud_color, c, c.label());
                     }
                 });
@@ -515,6 +622,13 @@ impl App {
         ui.label("Nominal values; distances are estimates, not calibrated.");
         ui.add(egui::Slider::new(&mut self.geometry.baseline_mm, 10.0..=200.0).text("Baseline mm"));
         ui.add(egui::Slider::new(&mut self.geometry.hfov_deg, 20.0..=140.0).text("H-FOV deg"));
+        if self.settings.geometry != self.geometry {
+            // The worker reprojects with its own copy; it must match the UI's.
+            self.settings.geometry = self.geometry;
+            if let Some(p) = &self.pipeline {
+                p.set_settings(self.settings.clone());
+            }
+        }
     }
 }
 
@@ -534,6 +648,7 @@ impl eframe::App for App {
         let ctx = &ctx;
         if let Some(p) = &self.pipeline {
             if let Some(result) = p.latest() {
+                self.pose = result.pose;
                 self.last = Some(result);
             }
             let gen = p.align_generation();
@@ -583,6 +698,28 @@ impl eframe::App for App {
                     ));
                     ui.separator();
                     ui.label(format!("valid {:.0}%", f.disp.valid_fraction() * 100.0));
+                    if self.settings.mapping {
+                        ui.separator();
+                        let o = f.odometry;
+                        let colour = if o.ok {
+                            egui::Color32::from_rgb(140, 200, 140)
+                        } else {
+                            egui::Color32::from_rgb(230, 160, 100)
+                        };
+                        ui.colored_label(
+                            colour,
+                            format!(
+                                "track {}/{}/{} in {:.0} mm rms | {:.0} ms",
+                                o.inliers, o.tracked, o.detected, o.rms_mm, f.odometry_ms
+                            ),
+                        )
+                        .on_hover_text("inliers / tracked / detected corners");
+                        ui.separator();
+                        ui.label(format!(
+                            "map {} voxels, {} frames | fuse {:.0} ms",
+                            self.map_stats.0, self.map_stats.1, f.map_ms
+                        ));
+                    }
                 }
             });
             if let Some(e) = &self.error {
@@ -612,8 +749,8 @@ impl eframe::App for App {
                 }
             };
 
-            if self.view == ViewMode::Cloud {
-                self.show_cloud(ui, ctx, range);
+            if matches!(self.view, ViewMode::Cloud | ViewMode::Map) {
+                self.show_points(ui, ctx, range);
                 return;
             }
 

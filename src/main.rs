@@ -7,8 +7,10 @@ mod cloud;
 mod colormap;
 mod headless;
 mod image;
+mod odometry;
 mod pipeline;
 mod stereo;
+mod voxelmap;
 
 use pipeline::ProcSettings;
 
@@ -16,11 +18,13 @@ const USAGE: &str = "\
 binocular-camera - live stereo depth viewer
 
   binocular-camera                 open the viewer (default)
+  binocular-camera --map           open the viewer with mapping already running
   binocular-camera probe           list capture devices and side-by-side modes
   binocular-camera shot [PREFIX]   capture one frame, match it, write PPMs
   binocular-camera bench [RUNS]    time the matcher at each downscale factor
   binocular-camera stability [N]   measure frame-to-frame disparity flicker
   binocular-camera cloud [PREFIX]  render the point cloud from several angles
+  binocular-camera odom [N]        run visual odometry over N frames, report drift
 
 Options for shot/bench:
   --disparities N   disparity search width (default 64)
@@ -31,6 +35,9 @@ Options for shot/bench:
   --p1 N / --p2 N   SGM smoothness penalties
   --speckle N       minimum region size kept, in pixels (default 80)
   --no-align        skip the automatic vertical alignment measurement
+  --odom-near M     ignore tracking corners beyond M metres (default 2.5)
+  --odom-cell N     corner grid cell in pixels (default 16)
+  --odom-inlier M   RANSAC inlier threshold in metres (default 0.03)
   --exposure N      lock exposure to N before capturing (shot only)
 ";
 
@@ -49,6 +56,9 @@ fn main() -> anyhow::Result<()> {
     if let Some(n) = value("--downscale") {
         settings.downscale = n.clamp(1, 8);
     }
+    if flag("--map") {
+        settings.mapping = true;
+    }
     if flag("--paths8") {
         settings.stereo.paths = stereo::PathCount::Eight;
     }
@@ -64,6 +74,15 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(n) = value("--p2") {
         settings.stereo.p2 = n.clamp(2, 2000) as u16;
+    }
+    if let Some(v) = fvalue("--odom-near") {
+        settings.odometry.max_feature_m = v.clamp(0.2, 50.0);
+    }
+    if let Some(n) = value("--odom-cell") {
+        settings.odometry.cell = n.clamp(8, 64);
+    }
+    if let Some(v) = fvalue("--odom-inlier") {
+        settings.odometry.inlier_m = v.clamp(0.002, 1.0);
     }
     if let Some(v) = fvalue("--uniqueness") {
         settings.stereo.uniqueness = v.clamp(1.0, 2.0);
@@ -86,6 +105,10 @@ fn main() -> anyhow::Result<()> {
                 !flag("--no-align"),
                 value("--exposure").map(|v| v as i64),
             )
+        }
+        Some("odom") => {
+            let n = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(40usize);
+            headless::odometry_test(n.clamp(4, 300), settings)
         }
         Some("cloud") => {
             let prefix = args
@@ -111,11 +134,11 @@ fn main() -> anyhow::Result<()> {
             print!("{USAGE}");
             Err(anyhow::anyhow!("unknown command: {other}"))
         }
-        _ => run_viewer(),
+        _ => run_viewer(settings),
     }
 }
 
-fn run_viewer() -> anyhow::Result<()> {
+fn run_viewer(settings: ProcSettings) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         // Only the initial window hint; everything inside lays out proportionally.
         viewport: eframe::egui::ViewportBuilder::default()
@@ -127,7 +150,7 @@ fn run_viewer() -> anyhow::Result<()> {
     eframe::run_native(
         "Binocular Depth Viewer",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, settings)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }

@@ -12,13 +12,15 @@ use anyhow::{anyhow, Result};
 use crate::align::{estimate_vertical_offset, Geometry};
 use crate::camera::{
     apply_exposure, current_exposure, exposure_ranges, list_capture_devices, probe_modes,
-    run_capture, CameraConfig, Exposure, StereoFrame,
+    run_capture, CameraConfig, Exposure, StereoFrame, DEFAULT_SWAP_LR,
 };
 use crate::cloud::{self, CloudColor, Orbit};
-use crate::colormap::{auto_range, colorize, Palette};
+use crate::colormap::{auto_range, colorize, Palette, Range};
 use crate::image::Gray;
+use crate::odometry::Odometry;
 use crate::pipeline::ProcSettings;
 use crate::stereo::match_stereo;
+use crate::voxelmap::VoxelMap;
 
 /// Print every capture device and the side-by-side modes it offers.
 pub fn probe() -> Result<()> {
@@ -180,7 +182,7 @@ pub fn shot(
     let cfg = CameraConfig {
         path: path.clone(),
         mode,
-        swap_lr: true,
+        swap_lr: DEFAULT_SWAP_LR,
     };
     let frame = grab(cfg, 12)?;
 
@@ -271,7 +273,7 @@ pub fn bench(settings: ProcSettings, runs: usize) -> Result<()> {
     let cfg = CameraConfig {
         path: path.clone(),
         mode,
-        swap_lr: true,
+        swap_lr: DEFAULT_SWAP_LR,
     };
     let frame = grab(cfg, 8)?;
 
@@ -322,7 +324,7 @@ pub fn stability(settings: ProcSettings, frames: usize) -> Result<()> {
     let cfg = CameraConfig {
         path: path.clone(),
         mode,
-        swap_lr: true,
+        swap_lr: DEFAULT_SWAP_LR,
     };
     println!("capturing {frames} frames from {path}...");
     let stack = grab_many(cfg, frames, 10)?;
@@ -467,7 +469,7 @@ pub fn cloud_shots(prefix: &str, settings: ProcSettings) -> Result<()> {
     let cfg = CameraConfig {
         path: path.clone(),
         mode,
-        swap_lr: true,
+        swap_lr: DEFAULT_SWAP_LR,
     };
     let frame = grab(cfg, 12)?;
 
@@ -527,6 +529,7 @@ pub fn cloud_shots(prefix: &str, settings: ProcSettings) -> Result<()> {
             CloudColor::Depth,
             Palette::Turbo,
             range,
+            Range { lo: -1.0, hi: 1.0 },
             2,
             true,
         );
@@ -535,5 +538,114 @@ pub fn cloud_shots(prefix: &str, settings: ProcSettings) -> Result<()> {
     }
     println!("render     : {:.1} ms per view at {w}x{h}", total / 4.0);
     println!("wrote      : {prefix}-{{front,left30,right30,above}}.ppm");
+    Ok(())
+}
+
+/// Run odometry over a burst of frames and report what it estimated.
+///
+/// The useful case is a camera that is not moving: every metre it reports is
+/// drift, and drift is the thing that decides whether frame-to-frame tracking
+/// is good enough to map with. Holding the camera still and reading the
+/// accumulated distance is a far more honest test than watching a map look
+/// plausible.
+pub fn odometry_test(frames: usize, settings: ProcSettings) -> Result<()> {
+    let devices = list_capture_devices();
+    let (path, _) = devices
+        .iter()
+        .find(|(p, _)| probe_modes(p).map(|m| !m.is_empty()).unwrap_or(false))
+        .ok_or_else(|| anyhow!("no device with side-by-side MJPEG modes"))?;
+    let modes = probe_modes(path)?;
+    let mode = modes
+        .iter()
+        .find(|m| m.full_w <= 2560 && m.full_h >= 720)
+        .copied()
+        .unwrap_or(modes[0]);
+    let cfg = CameraConfig {
+        path: path.clone(),
+        mode,
+        swap_lr: DEFAULT_SWAP_LR,
+    };
+    println!("capturing {frames} frames...");
+    let stack = grab_many(cfg, frames, 10)?;
+
+    let mut odom = Odometry::default();
+    let mut map = VoxelMap::default();
+    let mut steps = Vec::new();
+    let mut failures = 0usize;
+    let (mut track_ms, mut fuse_ms) = (0.0f32, 0.0f32);
+
+    for frame in &stack {
+        let left = frame.left.downscale(settings.downscale);
+        let right = frame
+            .right
+            .shift_vertical(settings.align.dy)
+            .downscale(settings.downscale);
+        let (disp, _) = match_stereo(&left, &right, &settings.stereo);
+
+        let t = Instant::now();
+        let step = odom.track(&left, &disp, &settings.geometry, &settings.odometry);
+        track_ms += t.elapsed().as_secs_f32() * 1000.0;
+        match step {
+            Some(st) => steps.push((
+                st.translation_norm() * 1000.0,
+                st.rotation_angle().to_degrees(),
+            )),
+            None => failures += 1,
+        }
+        if step.is_some() {
+            let t = Instant::now();
+            let pts = cloud::reproject(&disp, &left, &settings.geometry, settings.map.max_range_m);
+            map.integrate(&pts, &odom.pose, &settings.map);
+            fuse_ms += t.elapsed().as_secs_f32() * 1000.0;
+        }
+    }
+
+    let n = stack.len() as f32;
+    println!("frames        : {}", stack.len());
+    println!("tracked       : {} steps, {failures} rejected", steps.len());
+    let r = odom.report;
+    println!(
+        "last step     : {} inliers of {} tracked, {} detected",
+        r.inliers, r.tracked, r.detected
+    );
+    if !steps.is_empty() {
+        let mut t: Vec<f32> = steps.iter().map(|s| s.0).collect();
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut rot: Vec<f32> = steps.iter().map(|s| s.1).collect();
+        rot.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "per-step move : median {:.1} mm, worst {:.1} mm",
+            t[t.len() / 2],
+            t[t.len() - 1]
+        );
+        println!(
+            "per-step turn : median {:.2} deg, worst {:.2} deg",
+            rot[rot.len() / 2],
+            rot[rot.len() - 1]
+        );
+    }
+    println!(
+        "path length   : {:.3} m of accumulated motion",
+        odom.distance_travelled
+    );
+    let p = odom.pose;
+    println!(
+        "net displace  : {:.3} m from start ({:.1} deg)",
+        p.translation_norm(),
+        p.rotation_angle().to_degrees()
+    );
+    println!(
+        "map           : {} voxels from {} frames",
+        map.len(),
+        map.frames
+    );
+    println!(
+        "cost          : track {:.1} ms, fuse {:.1} ms per frame",
+        track_ms / n,
+        fuse_ms / n
+    );
+    println!();
+    println!("With the camera held still, path length is pure drift: it is the");
+    println!("error that accumulates whether or not anything actually moved.");
     Ok(())
 }

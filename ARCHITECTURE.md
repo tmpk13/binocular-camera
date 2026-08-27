@@ -21,7 +21,10 @@ flowchart TD
         WTA["winner selection<br/>subpixel + uniqueness + L/R check"]
         GATE["contrast gate<br/>reject untextured pixels"]
         CLEAN["despeckle + 3x3 median"]
+        ODOM["visual odometry<br/>corners, patch track,<br/>RANSAC + Horn fit"]
+        FUSE["voxel map<br/>log-odds + running mean"]
         TRIM --> DOWN --> CENSUS --> COST --> SGM --> WTA --> GATE --> CLEAN
+        CLEAN --> ODOM --> FUSE
     end
 
     subgraph ui["main thread"]
@@ -96,6 +99,19 @@ classDiagram
         Geometry
         estimate_vertical_offset()
     }
+    class odometry {
+        Pose
+        Odometry
+        OdometryParams
+        horn_transform()
+        track()
+    }
+    class voxelmap {
+        VoxelMap
+        MapParams
+        integrate()
+        to_points()
+    }
     class cloud {
         Point
         Orbit
@@ -125,6 +141,9 @@ classDiagram
     app --> align
     pipeline --> camera
     pipeline --> stereo
+    pipeline --> odometry
+    pipeline --> voxelmap
+    voxelmap --> cloud
     pipeline --> align
     stereo --> census
     stereo --> sgm

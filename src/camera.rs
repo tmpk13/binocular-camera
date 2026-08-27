@@ -73,11 +73,18 @@ pub struct CameraConfig {
     pub path: String,
     pub mode: CaptureMode,
     /// True when the physically-left sensor occupies the right half of the
-    /// combined frame. This module ships with it enabled because the attached
-    /// camera measures that way; a mis-set value makes every disparity negative
-    /// and the depth map empty.
+    /// combined frame. See [`DEFAULT_SWAP_LR`].
     pub swap_lr: bool,
 }
+
+/// Which half of the combined frame is treated as the left camera by default.
+///
+/// A mis-set value makes every disparity negative, and the depth map comes out
+/// empty rather than visibly mirrored - so it is worth trying both before
+/// concluding the matcher is broken. Kept as one named constant because the
+/// headless tools and the viewer must agree; if they disagree, `shot` stops
+/// being usable for diagnosing what the viewer shows.
+pub const DEFAULT_SWAP_LR: bool = false;
 
 /// Enumerate the MJPEG modes a device offers, best framerate first per size.
 pub fn probe_modes(path: &str) -> Result<Vec<CaptureMode>> {

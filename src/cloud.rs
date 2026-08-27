@@ -33,8 +33,9 @@ fn norm(v: Vec3) -> Vec3 {
 #[derive(Clone, Copy)]
 pub struct Point {
     pub pos: Vec3,
-    /// Kept so the cloud can be coloured the same way the depth view is.
-    pub disp: f32,
+    /// Whatever quantity the palette should map. The live cloud puts disparity
+    /// here; the map puts occupancy confidence.
+    pub scalar: f32,
     pub gray: u8,
 }
 
@@ -70,7 +71,7 @@ pub fn reproject(disp: &Disparity, gray: &Gray, geom: &Geometry, max_depth_m: f3
                     -(y as f32 - cy) * z / f,
                     z,
                 ],
-                disp: d,
+                scalar: d,
                 gray: gray.data[y * disp.w + x],
             });
         }
@@ -151,14 +152,20 @@ impl Orbit {
 pub enum CloudColor {
     /// Same palette as the depth view, so the two read consistently.
     Depth,
+    /// By height, which is what makes a map's floor, walls and clutter
+    /// separable once the view has been rotated away from the camera.
+    Height,
     /// Brightness from the camera image, which makes structure recognizable.
     Image,
 }
 
 impl CloudColor {
+    pub const ALL: [CloudColor; 3] = [CloudColor::Depth, CloudColor::Height, CloudColor::Image];
+
     pub fn label(self) -> &'static str {
         match self {
             CloudColor::Depth => "Depth",
+            CloudColor::Height => "Height",
             CloudColor::Image => "Image",
         }
     }
@@ -223,6 +230,7 @@ impl Renderer {
         color: CloudColor,
         palette: Palette,
         range: Range,
+        height_range: Range,
         point_size: u32,
         show_frustum: bool,
     ) -> &[u8] {
@@ -236,6 +244,7 @@ impl Renderer {
         let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
         let lut = palette.lut();
         let scale = 255.0 / (range.hi - range.lo).max(1e-3);
+        let hscale = 255.0 / (height_range.hi - height_range.lo).max(1e-3);
         let size = point_size.clamp(1, 8) as i32;
 
         let project = |p: Vec3| -> Option<(f32, f32, f32)> {
@@ -260,7 +269,10 @@ impl Renderer {
             }
             let rgb = match color {
                 CloudColor::Depth => {
-                    lut[(((p.disp - range.lo) * scale) as i32).clamp(0, 255) as usize]
+                    lut[(((p.scalar - range.lo) * scale) as i32).clamp(0, 255) as usize]
+                }
+                CloudColor::Height => {
+                    lut[(((p.pos[1] - height_range.lo) * hscale) as i32).clamp(0, 255) as usize]
                 }
                 CloudColor::Image => [p.gray, p.gray, p.gray],
             };
