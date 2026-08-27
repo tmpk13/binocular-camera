@@ -3,6 +3,7 @@
 mod align;
 mod app;
 mod camera;
+mod cloud;
 mod colormap;
 mod headless;
 mod image;
@@ -19,6 +20,7 @@ binocular-camera - live stereo depth viewer
   binocular-camera shot [PREFIX]   capture one frame, match it, write PPMs
   binocular-camera bench [RUNS]    time the matcher at each downscale factor
   binocular-camera stability [N]   measure frame-to-frame disparity flicker
+  binocular-camera cloud [PREFIX]  render the point cloud from several angles
 
 Options for shot/bench:
   --disparities N   disparity search width (default 64)
@@ -84,6 +86,14 @@ fn main() -> anyhow::Result<()> {
                 !flag("--no-align"),
                 value("--exposure").map(|v| v as i64),
             )
+        }
+        Some("cloud") => {
+            let prefix = args
+                .get(1)
+                .filter(|a| !a.starts_with("--"))
+                .cloned()
+                .unwrap_or_else(|| "cloud".into());
+            headless::cloud_shots(&prefix, settings)
         }
         Some("stability") => {
             let n = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(20usize);

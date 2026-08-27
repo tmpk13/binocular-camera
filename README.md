@@ -66,9 +66,23 @@ quietly destroys the depth map. Run it once on a textured scene.
 
 - **Depth** - the disparity map, coloured. Hover for the value and an estimated
   distance.
+- **Point cloud** - the same data reprojected to 3D and rotatable. Drag to
+  orbit, shift+drag to pan, scroll to zoom, **Reset view** to return to the
+  camera's own viewpoint. The wireframe outline marks where the camera stands,
+  which is the only thing keeping a rotated cloud oriented.
 - **Left** / **Right** - the rectified inputs the matcher actually sees.
 - **Anaglyph** - red/cyan overlay of the pair, the quickest way to eyeball
   whether the two views are row-aligned.
+
+### Reading a point cloud
+
+Depth error grows with the square of distance - a disparity is only accurate to
+a fraction of a pixel, and that fraction is worth more metres the further away
+it lands. Rotating the view makes this obvious: distant surfaces smear into
+spikes along the viewing direction while near ones stay compact. That is the
+measurement's real uncertainty becoming visible, not a rendering artifact.
+**Max distance** trims the far points, which are both the least reliable and the
+most visually dominant.
 
 ## Distances are estimates
 
@@ -111,6 +125,10 @@ setting, so if you are matching at 1/4 anyway, picking a smaller camera mode
 saves real time.
 
 ## Diagnostics
+
+`binocular-camera cloud [PREFIX]` renders the point cloud from four fixed angles
+to PPMs. Rotation is where sign and axis errors hide, so being able to check it
+without a window is worth the few lines.
 
 `binocular-camera stability [N]` captures N frames, matches each, and reports how
 much the disparity map actually changes between them, bucketed by local image

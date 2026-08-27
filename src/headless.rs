@@ -14,6 +14,7 @@ use crate::camera::{
     apply_exposure, current_exposure, exposure_ranges, list_capture_devices, probe_modes,
     run_capture, CameraConfig, Exposure, StereoFrame,
 };
+use crate::cloud::{self, CloudColor, Orbit};
 use crate::colormap::{auto_range, colorize, Palette};
 use crate::image::Gray;
 use crate::pipeline::ProcSettings;
@@ -446,5 +447,93 @@ pub fn stability(settings: ProcSettings, frames: usize) -> Result<()> {
     write_ppm("stability-contrast.ppm", &cimg, w, h)?;
     write_ppm("stability-left.ppm", &gray_rgb(&first), w, h)?;
     println!("\nwrote stability-flips.ppm, stability-contrast.ppm, stability-left.ppm");
+    Ok(())
+}
+
+/// Render the point cloud from several angles, to check the 3D math without a
+/// window. Rotation is exactly where sign and axis errors hide.
+pub fn cloud_shots(prefix: &str, settings: ProcSettings) -> Result<()> {
+    let devices = list_capture_devices();
+    let (path, _) = devices
+        .iter()
+        .find(|(p, _)| probe_modes(p).map(|m| !m.is_empty()).unwrap_or(false))
+        .ok_or_else(|| anyhow!("no device with side-by-side MJPEG modes"))?;
+    let modes = probe_modes(path)?;
+    let mode = modes
+        .iter()
+        .find(|m| m.full_w <= 2560 && m.full_h >= 720)
+        .copied()
+        .unwrap_or(modes[0]);
+    let cfg = CameraConfig {
+        path: path.clone(),
+        mode,
+        swap_lr: true,
+    };
+    let frame = grab(cfg, 12)?;
+
+    let left = frame.left.downscale(settings.downscale);
+    let right = frame
+        .right
+        .shift_vertical(settings.align.dy)
+        .downscale(settings.downscale);
+    let (disp, _) = match_stereo(&left, &right, &settings.stereo);
+    let range = auto_range(&disp, settings.stereo.max_disparity as f32);
+    let geom = Geometry::default();
+
+    let t = Instant::now();
+    let points = cloud::reproject(&disp, &left, &geom, 10.0);
+    let reproject_ms = t.elapsed().as_secs_f32() * 1000.0;
+    let mz = cloud::median_depth(&points);
+    println!(
+        "points     : {} of {} pixels",
+        points.len(),
+        disp.w * disp.h
+    );
+    println!("reproject  : {reproject_ms:.1} ms");
+    println!("median dist: {mz:.2} m");
+    if let (Some(near), Some(far)) = (
+        points
+            .iter()
+            .map(|p| p.pos[2])
+            .min_by(|a, b| a.partial_cmp(b).unwrap()),
+        points
+            .iter()
+            .map(|p| p.pos[2])
+            .max_by(|a, b| a.partial_cmp(b).unwrap()),
+    ) {
+        println!("range      : {near:.2} m to {far:.2} m");
+    }
+
+    let (w, h) = (640usize, 480usize);
+    let mut renderer = cloud::Renderer::default();
+    let mut total = 0.0;
+    for (name, yaw, pitch) in [
+        ("front", 0.0f32, 0.0f32),
+        ("left30", -0.52, 0.0),
+        ("right30", 0.52, 0.0),
+        ("above", 0.0, 0.6),
+    ] {
+        let orbit = Orbit {
+            yaw,
+            pitch,
+            ..Orbit::facing(mz)
+        };
+        let t = Instant::now();
+        let rgb = renderer.draw(
+            w,
+            h,
+            &points,
+            &orbit,
+            CloudColor::Depth,
+            Palette::Turbo,
+            range,
+            2,
+            true,
+        );
+        total += t.elapsed().as_secs_f32() * 1000.0;
+        write_ppm(&format!("{prefix}-{name}.ppm"), rgb, w, h)?;
+    }
+    println!("render     : {:.1} ms per view at {w}x{h}", total / 4.0);
+    println!("wrote      : {prefix}-{{front,left30,right30,above}}.ppm");
     Ok(())
 }

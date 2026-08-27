@@ -7,6 +7,7 @@ use crate::camera::{
     apply_exposure, current_exposure, exposure_ranges, list_capture_devices, probe_modes,
     CameraConfig, CaptureMode, ControlRange, Exposure,
 };
+use crate::cloud::{self, CloudColor, Orbit, Point};
 use crate::colormap::{anaglyph, auto_range, colorize, Palette, Range, RangeTracker};
 use crate::image::Gray;
 use crate::pipeline::{FrameResult, Pipeline, ProcSettings};
@@ -15,14 +16,16 @@ use crate::stereo::PathCount;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewMode {
     Depth,
+    Cloud,
     Left,
     Right,
     Anaglyph,
 }
 
 impl ViewMode {
-    const ALL: [ViewMode; 4] = [
+    const ALL: [ViewMode; 5] = [
         ViewMode::Depth,
+        ViewMode::Cloud,
         ViewMode::Left,
         ViewMode::Right,
         ViewMode::Anaglyph,
@@ -31,6 +34,7 @@ impl ViewMode {
     fn label(self) -> &'static str {
         match self {
             ViewMode::Depth => "Depth",
+            ViewMode::Cloud => "Point cloud",
             ViewMode::Left => "Left",
             ViewMode::Right => "Right",
             ViewMode::Anaglyph => "Anaglyph",
@@ -57,6 +61,18 @@ pub struct App {
     exposure: Exposure,
     exposure_limits: (ControlRange, ControlRange),
     geometry: Geometry,
+
+    orbit: Orbit,
+    orbit_framed: bool,
+    cloud: Vec<Point>,
+    cloud_seq: u64,
+    cloud_geom: Geometry,
+    cloud_max_depth: f32,
+    cloud_renderer: cloud::Renderer,
+    cloud_color: CloudColor,
+    point_size: u32,
+    max_depth_m: f32,
+    show_frustum: bool,
 
     texture: Option<egui::TextureHandle>,
     last: Option<FrameResult>,
@@ -92,6 +108,18 @@ impl App {
                 ControlRange { min: 0, max: 255 },
             ),
             geometry: Geometry::default(),
+            orbit: Orbit::default(),
+            orbit_framed: false,
+            cloud: Vec::new(),
+            cloud_seq: u64::MAX,
+            cloud_geom: Geometry::default(),
+            cloud_max_depth: 0.0,
+            cloud_renderer: cloud::Renderer::default(),
+            cloud_color: CloudColor::Depth,
+            point_size: 2,
+            max_depth_m: 10.0,
+            show_frustum: true,
+
             texture: None,
             last: None,
             error: None,
@@ -173,12 +201,97 @@ impl App {
     fn render_view(&self, frame: &FrameResult, range: Range) -> (Vec<u8>, usize, usize) {
         let (w, h) = (frame.left.w, frame.left.h);
         let rgb = match self.view {
-            ViewMode::Depth => colorize(&frame.disp, range, self.palette),
+            // Cloud is rendered by its own path; this arm only keeps the match
+            // exhaustive.
+            ViewMode::Depth | ViewMode::Cloud => colorize(&frame.disp, range, self.palette),
             ViewMode::Left => gray_to_rgb(&frame.left),
             ViewMode::Right => gray_to_rgb(&frame.right),
             ViewMode::Anaglyph => anaglyph(&frame.left, &frame.right),
         };
         (rgb, w, h)
+    }
+
+    /// Render the cloud and handle orbit/pan/zoom.
+    ///
+    /// The 3D points are rebuilt only when a new frame arrives or the geometry
+    /// changes, so dragging re-renders from a cached cloud rather than
+    /// reprojecting every mouse move.
+    fn show_cloud(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, range: Range) {
+        if let Some(frame) = &self.last {
+            let stale = frame.seq != self.cloud_seq
+                || self.cloud_geom != self.geometry
+                || self.cloud_max_depth != self.max_depth_m;
+            if stale {
+                self.cloud_seq = frame.seq;
+                self.cloud_geom = self.geometry;
+                self.cloud_max_depth = self.max_depth_m;
+                self.cloud =
+                    cloud::reproject(&frame.disp, &frame.left, &self.geometry, self.max_depth_m);
+                if !self.orbit_framed && !self.cloud.is_empty() {
+                    self.orbit = Orbit::facing(cloud::median_depth(&self.cloud));
+                    self.orbit_framed = true;
+                }
+            }
+        }
+
+        let avail = ui.available_size();
+        let ppp = ctx.pixels_per_point();
+        // Cap the raster: past a point, clearing the depth buffer costs more
+        // than drawing the points does.
+        let (mut w, mut h) = (avail.x * ppp, avail.y * ppp);
+        let over = (w / 1600.0).max(h / 1000.0).max(1.0);
+        w /= over;
+        h /= over;
+        let (w, h) = ((w as usize).max(64), (h as usize).max(64));
+
+        let image = {
+            let rgb = self.cloud_renderer.draw(
+                w,
+                h,
+                &self.cloud,
+                &self.orbit,
+                self.cloud_color,
+                self.palette,
+                range,
+                self.point_size,
+                self.show_frustum,
+            );
+            egui::ColorImage::from_rgb([w, h], rgb)
+        };
+        match &mut self.texture {
+            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                self.texture = Some(ctx.load_texture("view", image, egui::TextureOptions::LINEAR))
+            }
+        }
+
+        let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        if let Some(tex) = &self.texture {
+            ui.painter().image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        if response.dragged() {
+            let d = response.drag_delta();
+            if ui.input(|i| i.modifiers.shift) {
+                self.orbit.pan(d.x, d.y);
+            } else {
+                self.orbit.yaw -= d.x * 0.008;
+                self.orbit.pitch = (self.orbit.pitch + d.y * 0.008).clamp(-1.55, 1.55);
+            }
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                // Multiplicative, so zooming feels even at any distance.
+                self.orbit.distance =
+                    (self.orbit.distance * (1.0 - scroll * 0.0015)).clamp(0.02, 200.0);
+            }
+        }
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -367,6 +480,29 @@ impl App {
                     ui.selectable_value(&mut self.palette, p, p.label());
                 }
             });
+        if self.view == ViewMode::Cloud {
+            egui::ComboBox::from_id_salt("cloudcolor")
+                .selected_text(self.cloud_color.label())
+                .show_ui(ui, |ui| {
+                    for c in [CloudColor::Depth, CloudColor::Image] {
+                        ui.selectable_value(&mut self.cloud_color, c, c.label());
+                    }
+                });
+            ui.add(egui::Slider::new(&mut self.point_size, 1..=6).text("Point size"));
+            ui.add(
+                egui::Slider::new(&mut self.max_depth_m, 0.5..=30.0)
+                    .text("Max distance m")
+                    .logarithmic(true),
+            )
+            .on_hover_text(
+                "Discards far points, which are the least reliable and dominate the view.",
+            );
+            ui.checkbox(&mut self.show_frustum, "Show camera outline");
+            if ui.button("Reset view").clicked() {
+                self.orbit_framed = false;
+            }
+            ui.label("drag rotates, shift+drag pans, scroll zooms");
+        }
         ui.checkbox(&mut self.use_auto_range, "Auto colour range");
         if !self.use_auto_range {
             let dmax = self.settings.stereo.max_disparity as f32;
@@ -455,7 +591,7 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let Some(frame) = &self.last else {
+            if self.last.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(if self.pipeline.is_some() {
                         "waiting for first frame..."
@@ -464,14 +600,24 @@ impl eframe::App for App {
                     });
                 });
                 return;
+            }
+
+            let range = {
+                let frame = self.last.as_ref().expect("checked above");
+                if self.use_auto_range {
+                    let target = auto_range(&frame.disp, self.settings.stereo.max_disparity as f32);
+                    self.range_tracker.update(target)
+                } else {
+                    self.range
+                }
             };
 
-            let range = if self.use_auto_range {
-                let target = auto_range(&frame.disp, self.settings.stereo.max_disparity as f32);
-                self.range_tracker.update(target)
-            } else {
-                self.range
-            };
+            if self.view == ViewMode::Cloud {
+                self.show_cloud(ui, ctx, range);
+                return;
+            }
+
+            let frame = self.last.as_ref().expect("checked above");
             let (rgb, w, h) = self.render_view(frame, range);
             let image = egui::ColorImage::from_rgb([w, h], &rgb);
             match &mut self.texture {

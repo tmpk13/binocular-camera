@@ -36,6 +36,7 @@ flowchart TD
     SPLIT -->|"single-slot<br/>latest wins"| TRIM
     TRIM -.->|"slot still full:<br/>drop before decoding"| USB
     CLEAN -->|"single-slot<br/>latest wins"| RANGE
+    CLEAN --> CLOUD
     DRAW -.->|"live settings"| worker
     DRAW -.->|"swap L/R"| capture
 ```
@@ -95,6 +96,13 @@ classDiagram
         Geometry
         estimate_vertical_offset()
     }
+    class cloud {
+        Point
+        Orbit
+        Renderer
+        reproject()
+        draw()
+    }
     class colormap {
         Palette
         Range
@@ -112,6 +120,8 @@ classDiagram
     main --> app
     app --> pipeline
     app --> colormap
+    app --> cloud
+    cloud --> colormap
     app --> align
     pipeline --> camera
     pipeline --> stereo
