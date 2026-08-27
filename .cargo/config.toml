@@ -1,0 +1,3 @@
+[build]
+# The census/SGM inner loops lean on popcount and wide autovectorization.
+rustflags = ["-C", "target-cpu=native"]
